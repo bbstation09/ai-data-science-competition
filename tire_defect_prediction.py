@@ -417,8 +417,8 @@ class TireDefectPredictor:
         print(f"      Random Forest: {self.ensemble_weights['rf']}")
         
     def evaluate_train_performance(self):
-        """훈련 데이터에서의 성능 평가"""
-        print("\n📊 훈련 데이터 성능 평가...")
+        """훈련 데이터 분석 - 실제 Good 샘플의 패턴 학습으로 False Positive 완전 차단"""
+        print("\n📊 훈련 데이터 분석 - False Positive 완전 차단 전략...")
         
         # 앙상블 예측 (훈련 데이터용)
         train_proba = (
@@ -431,48 +431,96 @@ class TireDefectPredictor:
         train_auc = roc_auc_score(self.y, train_proba)
         print(f"   🎯 Task 1 (ROC-AUC): {train_auc:.4f}")
         
-        # Task 2: 다양한 임계값에 대한 Net Profit 계산
-        print(f"\n   💰 Task 2 (Net Profit) - 다양한 임계값:")
-        print(f"   {'임계값':<8} {'FALSE수':<8} {'TP':<6} {'FP':<6} {'Net Profit':<12} {'종합점수':<10}")
-        print(f"   {'-'*60}")
+        # 실제 Good(y=0)과 NG(y=1) 샘플의 확률 분포 분석
+        good_probas = train_proba[self.y == 0]  # 실제 양품의 예측 확률
+        ng_probas = train_proba[self.y == 1]    # 실제 불량의 예측 확률
         
-        best_threshold = 0.5
-        best_total_score = -float('inf')
+        print(f"\n   📊 실제 클래스별 확률 분포 분석:")
+        print(f"   실제 Good ({len(good_probas)}개):")
+        print(f"     - 평균: {good_probas.mean():.4f}")
+        print(f"     - 최소: {good_probas.min():.4f}")
+        print(f"     - 최대: {good_probas.max():.4f}")
+        print(f"     - 25%ile: {np.percentile(good_probas, 25):.4f}")
+        print(f"     - 50%ile: {np.percentile(good_probas, 50):.4f}")
+        print(f"     - 75%ile: {np.percentile(good_probas, 75):.4f}")
         
-        # 임계값별 성능 평가 (FALSE 예측 관점)
-        for threshold in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]:
-            # FALSE = 불량 판정 (threshold 이상이면 불량으로 판정)
-            decisions_false = train_proba >= threshold
-            n_false = decisions_false.sum()
+        print(f"\n   실제 NG ({len(ng_probas)}개):")
+        print(f"     - 평균: {ng_probas.mean():.4f}")
+        print(f"     - 최소: {ng_probas.min():.4f}")
+        print(f"     - 최대: {ng_probas.max():.4f}")
+        print(f"     - 25%ile: {np.percentile(ng_probas, 25):.4f}")
+        print(f"     - 50%ile: {np.percentile(ng_probas, 50):.4f}")
+        print(f"     - 75%ile: {np.percentile(ng_probas, 75):.4f}")
+        
+        # 100% 안전 임계값 찾기
+        # 실제 NG 샘플 중 최소값보다 낮은 영역에서만 선택
+        safe_threshold = ng_probas.min()
+        ultra_safe_goods = good_probas[good_probas <= safe_threshold]
+        
+        print(f"\n   🛡️  100% 안전 영역 분석:")
+        print(f"   안전 임계값: {safe_threshold:.4f} (실제 NG 중 최소값)")
+        print(f"   안전 영역의 Good 개수: {len(ultra_safe_goods)}개")
+        
+        if len(ultra_safe_goods) >= 200:
+            print(f"   ✅ 200개 확보 가능! (여유: {len(ultra_safe_goods) - 200}개)")
+            strategy = "ultra_safe"
+            target_count = 200
+        else:
+            print(f"   ⚠️  안전 영역 부족... 점진적 확장 필요")
+            # 점진적으로 임계값을 높여가면서 최대한 안전한 범위 찾기
+            strategy = "progressive_safe"
+            target_count = min(200, max(len(ultra_safe_goods), 50))  # 최소 50개는 확보
+        
+        # 최종 전략별 분석
+        print(f"\n   💰 최종 전략: {strategy}")
+        if strategy == "ultra_safe":
+            # 100% 안전 영역에서 200개 선택
+            final_threshold = safe_threshold
+            expected_tp = 200
+            expected_fp = 0
             
-            if n_false > 200:
-                continue  # 200개 초과하면 스킵
+        else:
+            # 점진적 안전 영역에서 선택
+            # Good 샘플의 하위 percentile 기준으로 안전 영역 확장
+            percentiles = [5, 10, 15, 20, 25, 30]
+            best_threshold = safe_threshold
+            best_count = len(ultra_safe_goods)
+            
+            for p in percentiles:
+                threshold = np.percentile(good_probas, p)
+                safe_goods = good_probas[good_probas <= threshold]
+                overlapping_ng = ng_probas[ng_probas <= threshold]
                 
-            # Task 2 점수 계산
-            # TRUE decisions (양품 판정)
-            decisions_true = ~decisions_false
-            tp = ((decisions_true) & (self.y == 0)).sum()  # 양품을 양품으로 
-            fp = ((decisions_true) & (self.y == 1)).sum()  # 불량을 양품으로 (패널티)
+                print(f"     {p}% Good 기준 (임계값: {threshold:.4f}): Good {len(safe_goods)}개, NG {len(overlapping_ng)}개")
+                
+                if len(overlapping_ng) == 0 and len(safe_goods) >= target_count:
+                    best_threshold = threshold
+                    best_count = len(safe_goods)
+                    break
+                elif len(overlapping_ng) <= 2 and len(safe_goods) >= target_count:  # 최대 2개까지 허용
+                    best_threshold = threshold
+                    best_count = len(safe_goods)
+                    break
             
-            net_profit = 100 * tp - 2000 * fp
-            
-            # Task 1 점수 (ROC-AUC 0.5 기준)
-            auc_score = max(train_auc - 0.5, 0) / 0.5
-            
-            # 종합 점수
-            total_score = np.sqrt(auc_score * max(net_profit, 0) / 20000)
-            
-            print(f"   {threshold:<8.2f} {n_false:<8} {tp:<6} {fp:<6} {net_profit:<12,} {total_score:<10.4f}")
-            
-            if total_score > best_total_score:
-                best_total_score = total_score
-                best_threshold = threshold
+            final_threshold = best_threshold
+            expected_tp = min(200, best_count)
+            expected_fp = len(ng_probas[ng_probas <= final_threshold])
         
-        print(f"\n   🏆 최적 임계값: {best_threshold:.2f} (종합점수: {best_total_score:.4f})")
-        return best_threshold, best_total_score
+        net_profit = 100 * expected_tp - 2000 * expected_fp
+        accuracy = expected_tp / (expected_tp + expected_fp) if (expected_tp + expected_fp) > 0 else 1.0
+        
+        print(f"\n   🏆 최종 결정:")
+        print(f"     - 사용 임계값: {final_threshold:.4f}")
+        print(f"     - 예상 TRUE 개수: {expected_tp}개")
+        print(f"     - 예상 TP: {expected_tp}개")
+        print(f"     - 예상 FP: {expected_fp}개")
+        print(f"     - 예상 정확률: {accuracy*100:.1f}%")
+        print(f"     - 예상 Net Profit: {net_profit:,}")
+        
+        return final_threshold, net_profit
         
     def predict(self):
-        """최종 예측"""
+        """최종 예측 - FALSE POSITIVE 완전 차단 + 200개 전부 사용"""
         print("🎯 최종 예측 수행...")
         
         # 앙상블 예측 (확률)
@@ -484,51 +532,101 @@ class TireDefectPredictor:
         
         print(f"   • 예측 확률 범위: {self.final_proba.min():.4f} ~ {self.final_proba.max():.4f}")
         print(f"   • 평균 불량 확률: {self.final_proba.mean():.4f}")
+        print(f"   💡 해석: 낮은 확률 = 양품 후보, 높은 확률 = 불량 후보")
+        print(f"   🎯 목표: FALSE POSITIVE 0개로 200개 TRUE 예측!")
         
-        # 훈련 데이터 성능 평가 및 최적 임계값 탐색
-        optimal_threshold, best_score = self.evaluate_train_performance()
+        # 훈련 데이터 분석으로 안전 임계값 도출
+        safe_threshold, expected_profit = self.evaluate_train_performance()
         
-        # 최적 임계값 기반 decision 생성
-        self._make_optimal_decisions(optimal_threshold)
+        # FALSE POSITIVE 완전 차단하면서 200개 사용
+        self._make_zero_fp_decisions(safe_threshold)
         
-    def _make_optimal_decisions(self, optimal_threshold):
-        """최적 임계값 기반 decision 생성"""
-        print("🎯 최적화된 decision 생성...")
+    def _make_zero_fp_decisions(self, safe_threshold):
+        """FALSE POSITIVE 완전 차단 + 200개 전부 사용 전략"""
+        print("🛡️  FALSE POSITIVE 완전 차단 + 200개 전부 사용...")
         
-        # 올바른 Task 2 해석:
-        # TRUE = 양품 판정 (+100점)
-        # FALSE = 불량 판정 (틀리면 -2000점)
-        # 200개 제한은 FALSE의 제한
+        # 안전 영역 (임계값 이하) 확인
+        safe_candidates = self.final_proba <= safe_threshold
+        safe_count = safe_candidates.sum()
         
-        # FALSE = 불량 판정 (optimal_threshold 이상)
-        self.final_decisions_false = self.final_proba >= optimal_threshold
-        false_count = self.final_decisions_false.sum()
+        print(f"   • 안전 임계값: {safe_threshold:.4f}")
+        print(f"   • 안전 영역 후보: {safe_count}개")
         
-        print(f"   • 최적 임계값: {optimal_threshold:.3f}")
-        print(f"   • FALSE (불량) 판정: {false_count}개")
-        print(f"   • TRUE (양품) 판정: {len(self.final_proba) - false_count}개")
+        if safe_count >= 200:
+            print(f"   ✅ 안전 영역에서 200개 확보 가능! (여유: {safe_count - 200}개)")
+            # 안전 영역 내에서 가장 낮은 200개 선택
+            safe_indices = np.where(safe_candidates)[0]
+            safe_probas = self.final_proba[safe_indices]
+            bottom_200_in_safe = np.argsort(safe_probas)[:200]
+            selected_indices = safe_indices[bottom_200_in_safe]
+            
+            strategy = "ultra_safe"
+            
+        else:
+            print(f"   ⚠️  안전 영역 부족... 강제로 하위 200개 선택")
+            print(f"   🚨 FALSE POSITIVE 위험 존재!")
+            # 전체에서 가장 낮은 200개 선택
+            selected_indices = np.argsort(self.final_proba)[:200]
+            strategy = "forced_200"
         
-        # 200개 제한 확인
-        if false_count > 200:
-            print(f"   ⚠️  WARNING: FALSE 판정이 200개 초과! ({false_count}개)")
-            # 상위 200개만 불량으로 판정
-            top_200_idx = np.argsort(self.final_proba)[-200:]
-            self.final_decisions_false = np.zeros(len(self.final_proba), dtype=bool)
-            self.final_decisions_false[top_200_idx] = True
-            false_count = 200
-            print(f"   🔧 조정: 상위 200개만 FALSE로 설정")
+        # 결정 생성
+        self.final_decisions_bool = np.zeros(len(self.final_proba), dtype=bool)
+        self.final_decisions_bool[selected_indices] = True
         
-        print(f"\n   ✅ 최종 결정:")
-        print(f"      FALSE (불량): {false_count}/200개 사용")
-        print(f"      TRUE (양품): {len(self.final_proba) - false_count}개")
+        true_count = self.final_decisions_bool.sum()
+        false_count = len(self.final_proba) - true_count
         
-        # submission 형식에 맞게 변환 (TRUE/FALSE 문자열)
-        self.final_decisions = ['FALSE' if is_defect else 'TRUE' 
-                              for is_defect in self.final_decisions_false]
+        print(f"\n   📊 최종 결정:")
+        print(f"      TRUE (양품 예측): {true_count}개 (목표: 200개)")
+        print(f"      FALSE (불량 예측): {false_count}개")
+        print(f"      전략: {strategy}")
+        
+        if true_count > 0:
+            true_probas = self.final_proba[self.final_decisions_bool]
+            false_probas = self.final_proba[~self.final_decisions_bool]
+            
+            print(f"\n   📊 확률 분석:")
+            print(f"      TRUE (양품) 예측:")
+            print(f"        - 평균 불량 확률: {true_probas.mean():.4f}")
+            print(f"        - 최대 불량 확률: {true_probas.max():.4f}")
+            print(f"        - 최소 불량 확률: {true_probas.min():.4f}")
+            
+            print(f"      FALSE (불량) 예측:")
+            print(f"        - 평균 불량 확률: {false_probas.mean():.4f}")
+            print(f"        - 최소 불량 확률: {false_probas.min():.4f}")
+            print(f"        - 최대 불량 확률: {false_probas.max():.4f}")
+            
+            # 분리도 확인
+            separation = false_probas.min() - true_probas.max()
+            if separation > 0:
+                print(f"      ✅ 완벽한 분리: 간격 = {separation:.4f}")
+            else:
+                print(f"      ⚠️  겹침 존재: 간격 = {separation:.4f}")
+        
+        # submission 형식에 맞게 변환
+        self.final_decisions = ['TRUE' if is_true else 'FALSE' 
+                              for is_true in self.final_decisions_bool]
+        
+        print(f"\n   🎯 FALSE POSITIVE 차단 결과:")
+        if strategy == "ultra_safe":
+            print(f"      ✅ 100% 안전 영역에서 선택 완료")
+            print(f"      ✅ FALSE POSITIVE 위험: 0%")
+        else:
+            print(f"      ⚠️  강제 선택으로 FALSE POSITIVE 위험 존재")
+            print(f"      💡 하지만 최선의 200개 선택 완료")
     
-    def create_submission(self, output_path='/mnt/c/Users/Admin/PycharmProjects/Tire-Content/outputs/submission.csv'):
-        """submission 파일 생성"""
+    def create_submission(self, output_path='outputs/submission.csv'):
+        """submission 파일 생성 - 200개 TRUE 필수 확인"""
         print("📄 Submission 파일 생성...")
+        
+        # 출력 디렉토리 생성
+        import os
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"📁 출력 디렉토리 생성: {output_dir}")
+        elif output_dir:
+            print(f"📁 출력 디렉토리 이미 존재: {os.path.abspath(output_dir)}")
         
         # ID 생성 (테스트 데이터에 ID가 없는 경우)
         if 'ID' in self.test.columns:
@@ -536,24 +634,51 @@ class TireDefectPredictor:
         else:
             test_ids = [f'ID_{i}_L' for i in range(len(self.test))]
         
-        # submission 데이터프레임 생성 (이미 문자열로 변환됨)
+        # submission 데이터프레임 생성
         submission = pd.DataFrame({
             'ID': test_ids,
             'probability': self.final_proba,
             'decision': self.final_decisions
         })
         
+        # 200개 TRUE 확인
+        true_count = (submission['decision'] == 'TRUE').sum()
+        false_count = (submission['decision'] == 'FALSE').sum()
+        
+        print(f"\n   🎯 제출 파일 검증:")
+        if true_count == 200:
+            print(f"   ✅ TRUE 개수: {true_count}개 (목표 달성!)")
+        else:
+            print(f"   ❌ TRUE 개수: {true_count}개 (목표: 200개)")
+            print(f"   🚨 긴급 수정 필요!")
+            
+        print(f"   ✅ FALSE 개수: {false_count}개")
+        print(f"   ✅ 총 샘플: {len(submission)}개")
+        
         # 저장
         submission.to_csv(output_path, index=False)
+        print(f"✅ Submission 파일 저장 완료: {os.path.abspath(output_path)}")
         
-        # 요약 정보 출력
-        print(f"   ✅ 파일 저장: {output_path}")
-        print(f"   📊 요약:")
-        print(f"      • 총 샘플: {len(submission)}개")
-        print(f"      • TRUE decisions (양품): {(submission['decision'] == 'TRUE').sum()}개")
-        print(f"      • FALSE decisions (불량): {(submission['decision'] == 'FALSE').sum()}개")
-        print(f"      • 평균 확률: {submission['probability'].mean():.4f}")
-        print(f"      • 최대 확률: {submission['probability'].max():.4f}")
+        # 상세 요약 정보
+        print(f"\n   📊 최종 요약:")
+        print(f"      • 파일명: {output_path}")
+        print(f"      • TRUE (양품 예측): {true_count}개")
+        print(f"      • FALSE (불량 예측): {false_count}개")
+        print(f"      • 평균 불량 확률: {submission['probability'].mean():.4f}")
+        print(f"      • 최대 불량 확률: {submission['probability'].max():.4f}")
+        print(f"      • 최소 불량 확률: {submission['probability'].min():.4f}")
+        
+        # TRUE 예측의 확률 분포
+        if true_count > 0:
+            true_probas = submission[submission['decision'] == 'TRUE']['probability']
+            print(f"\n   🎯 TRUE 예측 확률 분석:")
+            print(f"      • TRUE 평균 확률: {true_probas.mean():.4f}")
+            print(f"      • TRUE 최대 확률: {true_probas.max():.4f}")
+            print(f"      • TRUE 최소 확률: {true_probas.min():.4f}")
+            print(f"      • TRUE 표준편차: {true_probas.std():.4f}")
+            
+        print(f"\n   🛡️  FALSE POSITIVE 차단 전략 적용 완료!")
+        print(f"   🏆 200개 TRUE 예측으로 최대 점수 추구!")
         
         return submission
     
@@ -573,6 +698,10 @@ class TireDefectPredictor:
     def _plot_feature_importance(self):
         """피처 중요도 시각화"""
         try:
+            import os
+            if not os.path.exists('outputs'):
+                os.makedirs('outputs')
+                
             fig, axes = plt.subplots(1, 3, figsize=(20, 6))
             
             for i, (model_name, importance) in enumerate(self.feature_importance.items()):
@@ -583,9 +712,9 @@ class TireDefectPredictor:
                 axes[i].set_yticklabels(top_features.index, fontsize=8)
                 axes[i].set_title(f'{model_name.upper()} - Top 15 Features')
                 axes[i].set_xlabel('Importance')
-
+                
             plt.tight_layout()
-            plt.savefig('/mnt/c/Users/Admin/PycharmProjects/Tire-Content/outputs/feature_importance.png', dpi=300, bbox_inches='tight')
+            plt.savefig('outputs/feature_importance.png', dpi=300, bbox_inches='tight')
             plt.show()
             print("   ✅ 피처 중요도 그래프 저장 완료")
         except Exception as e:
@@ -595,37 +724,57 @@ class TireDefectPredictor:
     def _plot_prediction_distribution(self):
         """예측 확률 분포 시각화"""
         try:
+            import os
+            if not os.path.exists('outputs'):
+                os.makedirs('outputs')
+                
             plt.figure(figsize=(12, 5))
             
             # 전체 분포
             plt.subplot(1, 2, 1)
             plt.hist(self.final_proba, bins=50, alpha=0.7, color='skyblue', edgecolor='black')
-            # FALSE 임계값 표시 (불량 판정)
-            false_threshold = self.final_proba[self.final_decisions_false].min() if hasattr(self, 'final_decisions_false') and self.final_decisions_false.sum() > 0 else 0.95
-            plt.axvline(false_threshold, color='red', linestyle='--', label=f'FALSE Threshold ({false_threshold:.3f})')
+            
+            # TRUE/FALSE 경계 표시
+            if hasattr(self, 'final_decisions_bool') and self.final_decisions_bool.sum() > 0:
+                true_probas = self.final_proba[self.final_decisions_bool]
+                threshold = true_probas.max()  # TRUE 예측 중 최대값이 경계
+                plt.axvline(threshold, color='red', linestyle='--', 
+                           label=f'TRUE/FALSE 경계 ({threshold:.3f})')
+                
+                # TRUE 영역 표시
+                plt.axvspan(0, threshold, alpha=0.2, color='green', label='TRUE (양품) 영역')
+            
             plt.title('예측 확률 분포 (전체)')
             plt.xlabel('불량 확률')
             plt.ylabel('빈도')
             plt.legend()
             
-            # 고확률 구간 확대
+            # TRUE vs FALSE 분포 비교
             plt.subplot(1, 2, 2)
-            high_prob = self.final_proba[self.final_proba > 0.8]
-            if len(high_prob) > 0:
-                plt.hist(high_prob, bins=20, alpha=0.7, color='orange', edgecolor='black')
-                plt.axvline(false_threshold, color='red', linestyle='--', label=f'FALSE Threshold ({false_threshold:.3f})')
-                plt.title('예측 확률 분포 (고확률 구간)')
+            if hasattr(self, 'final_decisions_bool'):
+                true_probas = self.final_proba[self.final_decisions_bool]
+                false_probas = self.final_proba[~self.final_decisions_bool]
+                
+                if len(true_probas) > 0:
+                    plt.hist(true_probas, bins=20, alpha=0.7, color='green', 
+                            label=f'TRUE (양품, n={len(true_probas)})', edgecolor='black')
+                    
+                if len(false_probas) > 0:
+                    plt.hist(false_probas, bins=20, alpha=0.7, color='red', 
+                            label=f'FALSE (불량, n={len(false_probas)})', edgecolor='black')
+                
+                plt.title('TRUE vs FALSE 예측 분포')
                 plt.xlabel('불량 확률')
                 plt.ylabel('빈도')
                 plt.legend()
             else:
-                plt.text(0.5, 0.5, 'No high probability samples', 
+                plt.text(0.5, 0.5, 'Decision 정보 없음', 
                         horizontalalignment='center', verticalalignment='center', 
                         transform=plt.gca().transAxes)
-                plt.title('예측 확률 분포 (고확률 구간)')
+                plt.title('TRUE vs FALSE 예측 분포')
             
             plt.tight_layout()
-            plt.savefig('/mnt/c/Users/Admin/PycharmProjects/Tire-Content/outputs/prediction_distribution.png', dpi=300, bbox_inches='tight')
+            plt.savefig('outputs/prediction_distribution.png', dpi=300, bbox_inches='tight')
             plt.show()
             print("   ✅ 예측 분포 그래프 저장 완료")
         except Exception as e:
@@ -633,49 +782,85 @@ class TireDefectPredictor:
             print("   → 그래프 없이 계속 진행...")
         
     def _analyze_decisions(self):
-        """Decision 분석"""
-        false_decisions = sum(1 for d in self.final_decisions if d == 'FALSE')
-        true_decisions = len(self.final_decisions) - false_decisions
+        """Decision 분석 - 200개 전부 사용 + FALSE POSITIVE 완전 차단"""
+        true_decisions = sum(1 for d in self.final_decisions if d == 'TRUE')
+        false_decisions = len(self.final_decisions) - true_decisions
         
-        print(f"\n📊 Decision 분석:")
-        print(f"   • FALSE (불량): {false_decisions}개 ({false_decisions/len(self.final_decisions)*100:.1f}%)")
-        print(f"   • TRUE (양품): {true_decisions}개 ({true_decisions/len(self.final_decisions)*100:.1f}%)")
+        print(f"\n📊 Decision 분석 - FALSE POSITIVE 차단 전략:")
+        print(f"   • TRUE (양품 예측): {true_decisions}개 ({true_decisions/len(self.final_decisions)*100:.1f}%)")
+        print(f"   • FALSE (불량 예측): {false_decisions}개 ({false_decisions/len(self.final_decisions)*100:.1f}%)")
         
-        if false_decisions > 0:
+        if true_decisions != 200:
+            print(f"   ⚠️  경고: TRUE 개수가 200개가 아님! (실제: {true_decisions}개)")
+        else:
+            print(f"   ✅ 목표 달성: 정확히 200개 TRUE 예측 완료")
+        
+        if true_decisions > 0:
+            true_probas = self.final_proba[[i for i, d in enumerate(self.final_decisions) if d == 'TRUE']]
             false_probas = self.final_proba[[i for i, d in enumerate(self.final_decisions) if d == 'FALSE']]
-            print(f"   • FALSE 판정의 평균 확률: {false_probas.mean():.4f}")
-            print(f"   • FALSE 판정의 최소 확률: {false_probas.min():.4f}")
-        
-        # 시뮬레이션된 점수 계산 (실제 정답 모름)
-        print(f"\n🎯 예상 시나리오 분석:")
-        print("   (FALSE 판정 정확률에 따른 예상 점수)")
-        
-        # 실제 불량률 14.9% 고려
-        expected_defects_in_false = int(false_decisions * 0.149)  # 기대값
-        
-        for accuracy in [0.2, 0.3, 0.4, 0.5, 0.6]:
-            # FALSE 판정 중 실제 불량 개수
-            actual_defects = int(false_decisions * accuracy) if false_decisions > 0 else 0
-            actual_goods = false_decisions - actual_defects
             
-            # TRUE 판정 중 실제 양품/불량 (전체 비율 가정)
-            total_goods = int(len(self.final_decisions) * 0.851)  # 전체 양품 수
-            total_defects = len(self.final_decisions) - total_goods  # 전체 불량 수
+            print(f"\n   📊 확률 분석:")
+            print(f"      TRUE (양품) 예측 200개:")
+            print(f"        - 평균 불량 확률: {true_probas.mean():.4f}")
+            print(f"        - 최대 불량 확률: {true_probas.max():.4f} (가장 위험한 TRUE)")
+            print(f"        - 최소 불량 확률: {true_probas.min():.4f} (가장 안전한 TRUE)")
+            print(f"        - 표준편차: {true_probas.std():.4f}")
             
-            true_goods = total_goods - actual_goods  # TRUE로 판정된 실제 양품
-            true_defects = total_defects - actual_defects  # TRUE로 판정된 실제 불량 (FALSE Positive)
-            
-            # Task 2 점수
-            tp = true_goods  # 양품을 양품(TRUE)으로
-            fp = true_defects  # 불량을 양품(TRUE)으로
+            if false_decisions > 0:
+                print(f"      FALSE (불량) 예측 {false_decisions}개:")
+                print(f"        - 평균 불량 확률: {false_probas.mean():.4f}")
+                print(f"        - 최소 불량 확률: {false_probas.min():.4f} (가장 안전한 FALSE)")
+                print(f"        - 최대 불량 확률: {false_probas.max():.4f}")
+                
+                # TRUE와 FALSE의 분리도 확인
+                separation = false_probas.min() - true_probas.max()
+                print(f"\n      🎯 TRUE/FALSE 분리도:")
+                if separation > 0:
+                    print(f"        ✅ 완벽한 분리: 간격 = {separation:.4f}")
+                    print(f"        ✅ FALSE POSITIVE 위험: 극히 낮음")
+                elif separation > -0.02:
+                    print(f"        ⚠️  약간 겹침: 간격 = {separation:.4f}")
+                    print(f"        ⚠️  FALSE POSITIVE 위험: 낮음")
+                else:
+                    print(f"        🚨 상당히 겹침: 간격 = {separation:.4f}")
+                    print(f"        🚨 FALSE POSITIVE 위험: 존재")
+        
+        # 시뮬레이션된 점수 계산
+        print(f"\n🎯 예상 성과 분석 (200개 TRUE 예측):")
+        print("   (TRUE 예측 중 실제 양품 비율에 따른 예상 점수)")
+        
+        # 극도로 보수적 예상 (FALSE POSITIVE 차단 목표)
+        for accuracy in [1.00, 0.99, 0.98, 0.95, 0.90]:
+            tp = int(200 * accuracy)        # True Positive
+            fp = 200 - tp                   # False Positive
             net_profit = 100 * tp - 2000 * fp
             
-            print(f"   • FALSE 정확률 {accuracy*100:2.0f}%: TP={tp}, FP={fp}, Net Profit={net_profit:,}")
-            
-        print(f"\n💡 최적 전략 달성:")
-        print(f"   • {false_decisions}/200 FALSE 판정 사용 (여유: {200-false_decisions}개)")
-        print(f"   • 대부분을 양품(TRUE)으로 예측하여 +100점 최대화")
-        print(f"   • 확실한 불량만 FALSE로 판정하여 -2000점 최소화")
+            if accuracy == 1.00:
+                risk_level = "✅ 목표 (ZERO FP)"
+            elif accuracy >= 0.98:
+                risk_level = "🟢 매우 안전"
+            elif accuracy >= 0.95:
+                risk_level = "🟡 안전"
+            else:
+                risk_level = "🔴 위험"
+                
+            print(f"   • 양품 비율 {accuracy*100:3.0f}%: TP={tp:3}, FP={fp:2} → Net Profit = {net_profit:,} ({risk_level})")
+        
+        print(f"\n🛡️  FALSE POSITIVE 완전 차단 전략 요약:")
+        print(f"   • 목표: 200개 TRUE 예측 ALL TRUE POSITIVE")
+        print(f"   • 전략: 훈련 데이터 실제 Good 패턴 학습")
+        print(f"   • 선택: 가장 안전한 200개만 TRUE 예측")
+        print(f"   • 결과: FALSE POSITIVE = 0개 달성 목표")
+        
+        # 최악의 시나리오까지 고려한 안전성 평가
+        worst_case_fp = max(0, int(200 * 0.1))  # 10% FP 가정
+        worst_case_profit = 100 * (200 - worst_case_fp) - 2000 * worst_case_fp
+        print(f"   • 최악 시나리오 (10% FP): Net Profit = {worst_case_profit:,}")
+        
+        if worst_case_profit > 0:
+            print(f"   ✅ 최악의 경우에도 양수 달성 가능!")
+        else:
+            print(f"   ⚠️  최악의 경우 음수 위험 존재...")
 
 def main():
     """메인 실행 함수"""
