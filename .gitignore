@@ -1,0 +1,6 @@
+outputs/
+raw_data/
+conda_env/
+catboost_info/
+*.csv
+.DS_Store
