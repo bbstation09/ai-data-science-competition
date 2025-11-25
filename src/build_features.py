@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -32,12 +33,70 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "5-ai-and-datascience-competition"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 SEED = 42
+SIM_COLUMN_PATTERN = re.compile(r"^[xypXY][0-9]+$")
 
 
 def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
     train = pd.read_csv(DATA_DIR / "train.csv")
     test = pd.read_csv(DATA_DIR / "test.csv")
     return train, test
+
+
+def basic_preprocessing(train: pd.DataFrame, test: pd.DataFrame) -> None:
+    """Unify raw categorical/numeric columns before feature engineering."""
+
+    def _normalize_mass_pilot(df: pd.DataFrame) -> None:
+        if "Mass_Pilot" not in df.columns:
+            return
+        numeric = pd.to_numeric(df["Mass_Pilot"], errors="coerce")
+        df["Mass_Pilot"] = numeric.fillna(-1).astype(int)
+
+    def _encode_plant(df: pd.DataFrame, categories: pd.Index) -> None:
+        if "Plant" not in df.columns:
+            return
+        df["Plant"] = pd.Categorical(df["Plant"], categories=categories)
+        dummies = pd.get_dummies(df["Plant"], prefix="Plant", dtype=int)
+        df[dummies.columns] = dummies
+
+    def _coerce_numeric(df: pd.DataFrame, numeric_cols: List[str]) -> None:
+        for col in numeric_cols:
+            if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                # Guard against stray string tokens (e.g., spaces, '?') in numeric-looking fields.
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    for df in [train, test]:
+        _normalize_mass_pilot(df)
+
+    plant_sources = [df["Plant"] for df in [train, test] if "Plant" in df.columns]
+    if plant_sources:
+        combined = pd.concat(plant_sources, axis=0)
+        categories = pd.Categorical(combined.dropna()).categories
+        for df in [train, test]:
+            _encode_plant(df, categories)
+
+    numeric_candidates: set[str] = set()
+    for df in [train, test]:
+        for col in df.columns:
+            if col.startswith("Proc_Param") or SIM_COLUMN_PATTERN.match(col):
+                numeric_candidates.add(col)
+    numeric_cols = sorted(numeric_candidates)
+    for df in [train, test]:
+        _coerce_numeric(df, numeric_cols)
+
+
+def drop_simulation_source_columns(train: pd.DataFrame, test: pd.DataFrame) -> None:
+    """Drop high-dimensional raw FEM coordinate/pressure columns after aggregation."""
+    drop_cols = (
+        [f"x{i}" for i in range(256)]
+        + [f"y{i}" for i in range(256)]
+        + [f"p{i}" for i in range(256)]
+        + [f"X{i}" for i in range(1, 6)]
+        + [f"Y{i}" for i in range(1, 6)]
+    )
+    for df in [train, test]:
+        existing = [col for col in drop_cols if col in df.columns]
+        if existing:
+            df.drop(columns=existing, inplace=True)
 
 
 def add_design_features(train: pd.DataFrame, test: pd.DataFrame, target: pd.Series) -> None:
@@ -84,6 +143,62 @@ def add_design_features(train: pd.DataFrame, test: pd.DataFrame, target: pd.Seri
 
     for col in ["Width", "Aspect", "Inch"]:
         add_bin_ng_rate_feature(train, test, column=col, series=train[col], target=target, q=6)
+
+
+def add_tire_geometry_features(train: pd.DataFrame, test: pd.DataFrame, target: pd.Series) -> None:
+    """타이어 규격(폭/편평비/림)을 이용해 물리적 치수 피처 생성."""
+    required_cols = {"Width", "Aspect", "Inch"}
+    if not required_cols.issubset(train.columns):
+        return
+    for df in [train, test]:
+        df["Section_Height"] = df["Width"] * (df["Aspect"] / 100.0)
+        df["Rim_Diameter_mm"] = df["Inch"] * 25.4
+        df["Outer_Diameter_mm"] = 2.0 * df["Section_Height"] + df["Rim_Diameter_mm"]
+        df["Section_Area"] = np.pi * (df["Width"] / 2.0) * df["Section_Height"]
+        df["Volume_Proxy"] = df["Section_Area"] * (np.pi * (df["Rim_Diameter_mm"] / 2.0))
+        df["Height_to_Width"] = df["Section_Height"] / (df["Width"] + 1e-6)
+        df["Height_to_Rim"] = df["Section_Height"] / (df["Rim_Diameter_mm"] + 1e-6)
+        df["Outer_to_Rim"] = df["Outer_Diameter_mm"] / (df["Rim_Diameter_mm"] + 1e-6)
+    for col in ["Section_Height", "Rim_Diameter_mm", "Outer_Diameter_mm"]:
+        add_bin_ng_rate_feature(train, test, column=col, series=train[col], target=target, q=5)
+
+
+def add_plant_zscores(train: pd.DataFrame, test: pd.DataFrame, columns: List[str]) -> None:
+    """공장별 평균 대비 얼마나 벗어났는지 z-score로 표현."""
+    cols = [col for col in columns if col in train.columns]
+    if not cols or "Plant" not in train.columns:
+        return
+    plant_stats = train.groupby("Plant")[cols].agg(["mean", "std"]).swaplevel(axis=1)
+    global_stats = {}
+    for col in cols:
+        global_stats[("mean", col)] = train[col].mean()
+        global_stats[("std", col)] = train[col].std()
+
+    def _apply(df: pd.DataFrame) -> None:
+        aligned = plant_stats.reindex(df["Plant"]).copy()
+        for key, val in global_stats.items():
+            aligned[key].fillna(val, inplace=True)
+        for col in cols:
+            df[f"{col}_plant_z"] = (df[col] - aligned[("mean", col)].values) / (
+                aligned[("std", col)].values + 1e-6
+            )
+
+    _apply(train)
+    _apply(test)
+
+
+def add_g_feature_stats(train: pd.DataFrame, test: pd.DataFrame, target: pd.Series) -> None:
+    """G1~G4 변수에 z-score 및 분위수 NG rate 피처 추가."""
+    g_cols = [col for col in ["G1", "G2", "G3", "G4"] if col in train.columns]
+    if not g_cols:
+        return
+    means = train[g_cols].mean()
+    stds = train[g_cols].std().replace(0, 1)
+    for df in [train, test]:
+        for col in g_cols:
+            df[f"{col}_zscore"] = (df[col] - means[col]) / stds[col]
+    for col in g_cols:
+        add_bin_ng_rate_feature(train, test, column=col, series=train[col], target=target, q=5)
 
 
 def add_bin_ng_rate_feature(
@@ -156,6 +271,62 @@ def add_fem_cluster_features(train: pd.DataFrame, test: pd.DataFrame, p_cols: Li
             test[f"FEM_cluster_{k}_{cluster_id}"] = (test_labels == cluster_id).astype(int)
 
 
+def add_tire_size_clusters(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    columns: List[str],
+    target: pd.Series,
+    n_clusters_list: List[int],
+    min_cluster_size: int = 40,
+) -> pd.DataFrame | None:
+    """폭/단면높이/림 직경 기반 KMeans 군집을 여러 k로 시도하고 최적 k를 선택."""
+    cols = [col for col in columns if col in train.columns]
+    if len(cols) < 3 or not n_clusters_list:
+        return None
+    combined = pd.concat([train[cols], test[cols]], ignore_index=True)
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(combined.fillna(combined.mean()))
+    cluster_records = []
+    best_choice = None
+    best_metric = -np.inf
+
+    for k in n_clusters_list:
+        km = KMeans(n_clusters=k, random_state=SEED, n_init=30)
+        labels = km.fit_predict(scaled)
+        train_labels = labels[: len(train)]
+        test_labels = labels[len(train) :]
+        stats = (
+            pd.DataFrame({"cluster": train_labels, "target": target})
+            .groupby("cluster", observed=True)["target"]
+            .agg(["mean", "count"])
+            .rename(columns={"mean": "ng_rate", "count": "samples"})
+        )
+        stats["k"] = k
+        stats["cluster"] = stats.index
+        cluster_records.append(stats.reset_index(drop=True))
+        min_samples = stats["samples"].min()
+        spread = stats["ng_rate"].max() - stats["ng_rate"].min()
+        metric = spread if min_samples >= min_cluster_size else spread - 0.05
+        if metric > best_metric:
+            best_metric = metric
+            best_choice = {"k": k, "train_labels": train_labels, "test_labels": test_labels, "stats": stats}
+
+    if best_choice is None:
+        return None
+
+    train["TireSize_cluster"] = best_choice["train_labels"]
+    test["TireSize_cluster"] = best_choice["test_labels"]
+    ng_map = best_choice["stats"]["ng_rate"].to_dict()
+    train["TireSize_cluster_NG_rate"] = train["TireSize_cluster"].map(ng_map)
+    test["TireSize_cluster_NG_rate"] = test["TireSize_cluster"].map(ng_map)
+
+    stats_df = pd.concat(cluster_records, ignore_index=True)
+    stats_df["selected"] = stats_df["k"] == best_choice["k"]
+    stats_df.to_csv(OUTPUT_DIR / "tire_size_cluster_stats.csv", index=False)
+    print(f"[build_features] Tire size cluster candidate stats saved (selected k={best_choice['k']}).")
+    return stats_df
+
+
 def add_fem_pca(train: pd.DataFrame, test: pd.DataFrame, p_cols: List[str]) -> List[str]:
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train[p_cols])
@@ -217,6 +388,8 @@ def add_proc_bin_features(
         except ValueError:
             continue
         intervals = bins.cat.categories
+        if len(intervals) == 0:
+            continue
         edges = [intervals[0].left]
         edges.extend(interval.right for interval in intervals)
         edges[0] = min(edges[0], series.min())
@@ -398,13 +571,17 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     train_feats = train.copy()
     test_feats = test.copy()
+    basic_preprocessing(train_feats, test_feats)
 
-    p_cols = [c for c in train.columns if c.startswith("p")]
+    p_cols = [c for c in train_feats.columns if c.startswith("p")]
     proc_cols = [
-        c for c in train.columns if c.startswith("Proc_Param") and pd.api.types.is_numeric_dtype(train[c])
+        c
+        for c in train_feats.columns
+        if c.startswith("Proc_Param") and pd.api.types.is_numeric_dtype(train_feats[c])
     ]
 
     add_design_features(train_feats, test_feats, target)
+    add_tire_geometry_features(train_feats, test_feats, target)
     add_fem_statistics(train_feats, test_feats, p_cols)
     add_fem_quantiles(train_feats, test_feats, p_cols)
     add_fem_cluster_features(
@@ -417,6 +594,16 @@ def main(args: argparse.Namespace | None = None) -> None:
     add_fem_risk_score(train_feats, test_feats, p_cols, target)
     add_proc_features(train_feats, test_feats, proc_cols, target)
     add_plant_features(train_feats, test_feats, target, p_cols)
+    add_g_feature_stats(train_feats, test_feats, target)
+    add_plant_zscores(
+        train_feats,
+        test_feats,
+        columns=[
+            "Section_Height",
+            "Rim_Diameter_mm",
+            "Outer_Diameter_mm",
+        ],
+    )
     add_pca_alignment_features(train_feats, test_feats)
     drop_correlated_proc(train_feats, test_feats, proc_cols)
 
@@ -427,6 +614,18 @@ def main(args: argparse.Namespace | None = None) -> None:
         base_cols=interaction_cols,
         max_pairs=args.interaction_pairs,
     )
+    size_cols = ["Width", "Section_Height", "Rim_Diameter_mm", "Outer_Diameter_mm"]
+    cluster_stats = add_tire_size_clusters(
+        train_feats,
+        test_feats,
+        size_cols,
+        target,
+        n_clusters_list=[4, 5, 6, 7, 8],
+    )
+    if cluster_stats is not None:
+        print("[build_features] Tire size cluster NG rate comparison:")
+        print(cluster_stats.groupby("k")[["ng_rate"]].agg(["min", "max"]))
+    drop_simulation_source_columns(train_feats, test_feats)
 
     for df in [train_feats, test_feats]:
         id_cols = [c for c in df.columns if c.lower().startswith("id")]
@@ -446,6 +645,11 @@ def main(args: argparse.Namespace | None = None) -> None:
         "Width_log1p",
         "Aspect_log1p",
         "Inch_log1p",
+        "Section_Height",
+        "Rim_Diameter_mm",
+        "Outer_Diameter_mm",
+        "Section_Area",
+        "Volume_Proxy",
         "p_min",
         "p_max",
         "p_mean",

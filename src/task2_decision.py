@@ -26,7 +26,13 @@ def load_predictions() -> pd.DataFrame:
     if not pred_path.exists():
         pred_path = OUTPUT_DIR / "task1_test_pred.csv"
     preds = pd.read_csv(pred_path)
-    preds = preds.rename(columns={"probability": "prob_ng"})
+    if "probability" not in preds.columns and preds.shape[1] == 1:
+        preds.columns = ["probability"]
+    if "probability" not in preds.columns and "prob_ng" in preds.columns:
+        preds = preds.rename(columns={"prob_ng": "probability"})
+    if "probability" not in preds.columns:
+        raise ValueError("prediction file must contain 'probability' column")
+    preds = preds[["probability"]].rename(columns={"probability": "prob_ng"})
     return preds
 
 

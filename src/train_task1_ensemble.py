@@ -31,6 +31,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import rankdata
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 try:
     import lightgbm as lgb
@@ -72,12 +76,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_tuning", action="store_true", help="Optuna 생략 시 기존 best_params.json 사용")
     parser.add_argument("--stacker", type=str, default="logistic", choices=["logistic", "lightgbm"], help="Level-2 meta 모델")
     parser.add_argument("--enable_tabnet", action="store_true", help="TabNet 학습 포함 (설치 필요)")
+    parser.add_argument("--enable_cnn", action="store_true", help="FEM 2D CNN Level-1 모델 포함")
     parser.add_argument("--calibration_metric", type=str, default="auc", choices=["auc", "brier"], help="보정 기법 선택 기준")
     parser.add_argument(
         "--models",
         type=str,
         default="lightgbm,xgboost,catboost,extratrees",
         help="쉼표 구분 Level-1 모델 목록",
+    )
+    parser.add_argument(
+        "--blend_modes",
+        type=str,
+        default="rank,geometric",
+        help="추가 블렌딩 모드 (rank, geometric 등)",
+    )
+    parser.add_argument(
+        "--reuse_predictions",
+        action="store_true",
+        help="현재 저장된 level1/meta 예측을 사용하고 재학습을 생략",
     )
     return parser.parse_args()
 
@@ -159,6 +175,15 @@ def suggest_params(model: str, trial: optuna.Trial) -> Dict:
             "n_steps": trial.suggest_int("n_steps", 3, 7),
             "gamma": trial.suggest_float("gamma", 1.0, 2.0),
             "lambda_sparse": trial.suggest_float("lambda_sparse", 1e-5, 1e-3, log=True),
+        }
+    if model == "fem_cnn":
+        return {
+            "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+            "dropout": trial.suggest_float("dropout", 0.1, 0.5),
+            "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+            "batch_size": trial.suggest_categorical("batch_size", [32, 48, 64, 96]),
+            "epochs": trial.suggest_int("epochs", 40, 90),
+            "patience": trial.suggest_int("patience", 6, 15),
         }
     raise ValueError(f"Unsupported model {model}")
 
@@ -517,12 +542,144 @@ def train_tabnet(
     return {"name": "tabnet", "oof": oof, "test": test_pred, "models": models, "params": base_params}
 
 
+class FEMCNN(nn.Module):
+    def __init__(self, dropout: float = 0.3):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        return self.classifier(x).squeeze(1)
+
+
+def numpy_to_loader(x: np.ndarray, y: np.ndarray | None, batch_size: int, shuffle: bool) -> DataLoader:
+    tensor_x = torch.from_numpy(x)
+    if y is not None:
+        tensor_y = torch.from_numpy(y.astype(np.float32))
+        dataset = TensorDataset(tensor_x, tensor_y)
+    else:
+        dataset = TensorDataset(tensor_x)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def train_fem_cnn(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    target: pd.Series,
+    params: Dict,
+    seeds: List[int],
+    n_splits: int,
+) -> Dict:
+    p_cols = [c for c in train.columns if c.startswith("p")]
+    if len(p_cols) != 256:
+        raise RuntimeError("FEM CNN expects 256 pressure columns (p0~p255)")
+    p_cols = sorted(p_cols, key=lambda x: int(x[1:]))
+    height = width = 16
+    train_arr = train[p_cols].to_numpy(dtype=np.float32).reshape(-1, 1, height, width)
+    test_arr = test[p_cols].to_numpy(dtype=np.float32).reshape(-1, 1, height, width)
+    mean = train_arr.mean()
+    std = train_arr.std() + 1e-6
+    train_arr = (train_arr - mean) / std
+    test_arr = (test_arr - mean) / std
+    max_epochs = params.get("epochs", 60)
+    batch_size = params.get("batch_size", 64)
+    learning_rate = params.get("learning_rate", 1e-3)
+    weight_decay = params.get("weight_decay", 1e-4)
+    patience = params.get("patience", 10)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    oof, counts, test_pred = average_oof_test(len(train), len(test), len(seeds) * n_splits)
+    total_models = 0
+    target_arr = target.to_numpy(dtype=np.float32)
+    criterion = nn.BCEWithLogitsLoss()
+    for seed in seeds:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        folds = stratified_folds(n_splits, seed, train, target)
+        for fold_id, (tr_idx, val_idx) in enumerate(folds):
+            model = FEMCNN(dropout=params.get("dropout", 0.3)).to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            train_loader = numpy_to_loader(train_arr[tr_idx], target_arr[tr_idx], batch_size, shuffle=True)
+            val_loader = numpy_to_loader(train_arr[val_idx], target_arr[val_idx], batch_size, shuffle=False)
+            test_loader = numpy_to_loader(test_arr, None, batch_size, shuffle=False)
+            best_auc = 0.0
+            best_state = None
+            patience_counter = 0
+            for epoch in range(max_epochs):
+                model.train()
+                for batch in train_loader:
+                    optimizer.zero_grad()
+                    inputs, labels = batch[0].to(device), batch[1].to(device)
+                    logits = model(inputs)
+                    loss = criterion(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+                model.eval()
+                val_logits = []
+                with torch.no_grad():
+                    for batch in val_loader:
+                        inputs, labels = batch[0].to(device), batch[1].to(device)
+                        logits = model(inputs)
+                        val_logits.append(torch.sigmoid(logits).cpu().numpy())
+                val_pred = np.concatenate(val_logits)
+                val_auc = roc_auc_score(target_arr[val_idx], val_pred)
+                if val_auc > best_auc + 1e-4:
+                    best_auc = val_auc
+                    best_state = model.state_dict()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        break
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            model.eval()
+            with torch.no_grad():
+                val_preds = []
+                for batch in val_loader:
+                    inputs = batch[0].to(device)
+                    logits = model(inputs)
+                    val_preds.append(torch.sigmoid(logits).cpu().numpy())
+                val_pred = np.concatenate(val_preds)
+            fold_test_pred = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    inputs = batch[0].to(device)
+                    logits = model(inputs)
+                    fold_test_pred.append(torch.sigmoid(logits).cpu().numpy())
+            fold_test_pred = np.concatenate(fold_test_pred)
+            update_predictions(oof, counts, test_pred, val_idx, val_pred, fold_test_pred)
+            total_models += 1
+    oof, test_pred = finalize_predictions(oof, counts, test_pred, total_models)
+    return {"name": "fem_cnn", "oof": oof, "test": test_pred, "params": {"mean": float(mean), "std": float(std)}}
+
+
 MODEL_FUNCS = {
     "lightgbm": train_lightgbm,
     "xgboost": train_xgboost,
     "catboost": train_catboost,
     "extratrees": train_extratrees,
     "tabnet": train_tabnet,
+    "fem_cnn": train_fem_cnn,
 }
 
 
@@ -535,6 +692,7 @@ def train_base_models(
     n_trials: int,
     skip_tuning: bool,
     enable_tabnet: bool,
+    enable_cnn: bool,
     models: List[str],
 ) -> List[Dict]:
     best_params: Dict[str, Dict] = {}
@@ -545,6 +703,8 @@ def train_base_models(
     models_to_train = [m for m in models if m in MODEL_FUNCS]
     if enable_tabnet and "tabnet" not in models_to_train:
         models_to_train.append("tabnet")
+    if enable_cnn and "fem_cnn" not in models_to_train:
+        models_to_train.append("fem_cnn")
 
     trained_models = []
     for name in models_to_train:
@@ -617,6 +777,33 @@ def stack_meta_model(
     return {"name": "stacker", "oof": oof, "test": test_pred, "models": models}
 
 
+def build_blend_results(base_models: List[Dict], modes: List[str]) -> List[Dict]:
+    modes = [mode.strip().lower() for mode in modes if mode.strip()]
+    if len(base_models) < 2 or not modes:
+        return []
+    data_oof = np.column_stack([m["oof"] for m in base_models])
+    data_test = np.column_stack([m["test"] for m in base_models])
+    results: List[Dict] = []
+    n_samples = data_oof.shape[0]
+    denom = max(n_samples - 1, 1)
+    for mode in modes:
+        if mode == "rank":
+            ranks_oof = np.zeros_like(data_oof)
+            ranks_test = np.zeros_like(data_test)
+            for idx in range(data_oof.shape[1]):
+                ranks_oof[:, idx] = rankdata(data_oof[:, idx], method="average")
+                ranks_test[:, idx] = rankdata(data_test[:, idx], method="average")
+            blend_oof = ((ranks_oof - 1) / denom).mean(axis=1)
+            blend_test = ((ranks_test - 1) / max(data_test.shape[0] - 1, 1)).mean(axis=1)
+            results.append({"name": "blend_rank", "oof": blend_oof, "test": blend_test})
+        elif mode == "geometric":
+            eps = 1e-9
+            oof_geo = np.exp(np.mean(np.log(np.clip(data_oof, eps, 1 - eps)), axis=1))
+            test_geo = np.exp(np.mean(np.log(np.clip(data_test, eps, 1 - eps)), axis=1))
+            results.append({"name": "blend_geometric", "oof": oof_geo, "test": test_geo})
+    return results
+
+
 def calibration_platt(probs: np.ndarray, target: np.ndarray, test_probs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     model = LogisticRegression(max_iter=200)
     probs = np.clip(probs, 1e-5, 1 - 1e-5)
@@ -675,6 +862,17 @@ def apply_calibrations(oof: np.ndarray, test: np.ndarray, target: np.ndarray, me
         pd.DataFrame({"row_id": np.arange(len(cal_test)), "probability": cal_test}).to_csv(
             OUTPUT_DIR / f"task1_calibrated_{name}_test.csv", index=False
         )
+    if len(cal_predictions) > 1:
+        stack_names = list(cal_predictions.keys())
+        oof_stack = np.vstack([cal_oof_store[n] for n in stack_names])
+        test_stack = np.vstack([cal_predictions[n] for n in stack_names])
+        ens_oof = oof_stack.mean(axis=0)
+        ens_test = test_stack.mean(axis=0)
+        ens_auc = roc_auc_score(target, ens_oof)
+        ens_brier = brier_score_loss(target, ens_oof)
+        metrics["mean_ensemble"] = {"auc": ens_auc, "brier": ens_brier}
+        cal_predictions["mean_ensemble"] = ens_test
+        cal_oof_store["mean_ensemble"] = ens_oof
     if metric == "auc":
         best_name = max(metrics.items(), key=lambda x: x[1]["auc"])[0]
     else:
@@ -702,43 +900,93 @@ def save_submission(test_pred: np.ndarray, test_len: int) -> None:
     submission.to_csv(OUTPUT_DIR / "task1_ensemble_submission.csv", index=False)
 
 
-def save_metrics(base_models: List[Dict], stack_result: Dict, target: pd.Series) -> None:
+def save_metrics(
+    base_models: List[Dict], stack_result: Dict, extra_results: List[Dict], target: pd.Series, selected_name: str
+) -> None:
     metrics = {}
     for model in base_models:
         metrics[model["name"]] = float(roc_auc_score(target, model["oof"]))
     metrics["stacker"] = float(roc_auc_score(target, stack_result["oof"]))
+    for result in extra_results:
+        metrics[result["name"]] = float(roc_auc_score(target, result["oof"]))
+    metrics["selected_ensemble"] = selected_name
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with (OUTPUT_DIR / "task1_ensemble_metrics.json").open("w", encoding="utf-8") as fp:
         json.dump(metrics, fp, indent=2)
+
+
+def load_saved_predictions(models: List[str]) -> tuple[List[Dict], Dict]:
+    if not models:
+        return [], {}
+    base_models = []
+    for name in models:
+        oof_path = OUTPUT_DIR / f"task1_level1_{name}_oof.csv"
+        test_path = OUTPUT_DIR / f"task1_level1_{name}_test.csv"
+        if not oof_path.exists() or not test_path.exists():
+            raise FileNotFoundError(f"Missing level1 prediction files for {name}")
+        oof = pd.read_csv(oof_path)["probability"].to_numpy()
+        test = pd.read_csv(test_path)["probability"].to_numpy()
+        base_models.append({"name": name, "oof": oof, "test": test})
+    meta = {}
+    meta_oof_path = OUTPUT_DIR / "task1_meta_oof.csv"
+    meta_test_path = OUTPUT_DIR / "task1_meta_test.csv"
+    if meta_oof_path.exists() and meta_test_path.exists():
+        meta = {
+            "name": "stacker",
+            "oof": pd.read_csv(meta_oof_path)["probability"].to_numpy(),
+            "test": pd.read_csv(meta_test_path)["probability"].to_numpy(),
+        }
+    return base_models, meta
 
 
 def run(args: argparse.Namespace | None = None) -> Dict:
     args = args or parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     model_list = [m.strip() for m in args.models.split(",") if m.strip()]
+    blend_modes = [m.strip() for m in args.blend_modes.split(",") if m.strip()]
     train, test = load_features()
     target = (train["Class"] == "NG").astype(int)
 
-    base_models = train_base_models(
-        train,
-        test,
-        target,
-        seeds=seeds,
-        n_splits=args.n_splits,
-        n_trials=args.n_trials,
-        skip_tuning=args.skip_tuning,
-        enable_tabnet=args.enable_tabnet,
-        models=model_list,
-    )
-    stack_result = stack_meta_model(base_models, target, seeds, args.n_splits, args.stacker)
-    save_metrics(base_models, stack_result, target)
-    calibration_info = apply_calibrations(stack_result["oof"], stack_result["test"], target, args.calibration_metric)
+    if args.reuse_predictions:
+        base_models, stack_result = load_saved_predictions(model_list)
+        if not base_models or not stack_result:
+            raise RuntimeError("Missing saved predictions. Run without --reuse_predictions first.")
+    else:
+        base_models = train_base_models(
+            train,
+            test,
+            target,
+            seeds=seeds,
+            n_splits=args.n_splits,
+            n_trials=args.n_trials,
+            skip_tuning=args.skip_tuning,
+            enable_tabnet=args.enable_tabnet,
+            enable_cnn=args.enable_cnn,
+            models=model_list,
+        )
+        stack_result = stack_meta_model(base_models, target, seeds, args.n_splits, args.stacker)
+    blend_results = build_blend_results(base_models, blend_modes)
+    best_candidate = stack_result
+    best_name = stack_result["name"]
+    best_auc = roc_auc_score(target, best_candidate["oof"])
+    for result in blend_results:
+        result_auc = roc_auc_score(target, result["oof"])
+        result["auc"] = result_auc
+        if result_auc > best_auc:
+            best_auc = result_auc
+            best_candidate = result
+            best_name = result["name"]
+    save_metrics(base_models, stack_result, blend_results, target, best_name)
+    calibration_info = apply_calibrations(best_candidate["oof"], best_candidate["test"], target, args.calibration_metric)
+    calibration_info["ensemble_source"] = best_name
     save_submission(calibration_info["test_pred"], len(test))
     return {
         "base_models": base_models,
         "stack_result": stack_result,
+        "blend_results": blend_results,
         "calibration": calibration_info,
         "seeds": seeds,
+        "selected_ensemble": best_name,
     }
 
 

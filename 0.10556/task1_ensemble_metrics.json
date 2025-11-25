@@ -1,0 +1,9 @@
+{
+  "lightgbm": 0.7473815005107408,
+  "xgboost": 0.7054397707002484,
+  "catboost": 0.736747419615496,
+  "stacker": 0.7430440151850102,
+  "blend_rank": 0.74550624323459,
+  "blend_geometric": 0.7488222469546127,
+  "selected_ensemble": "blend_geometric"
+}

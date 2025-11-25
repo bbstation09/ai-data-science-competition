@@ -199,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--thr_range",
         type=str,
-        default="0.80,0.99,0.01",
+        default="0.80,0.95,0.0005",
         help="min,max,step 형식으로 threshold(p_good) 탐색 범위를 지정",
     )
     parser.add_argument(
@@ -211,19 +211,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected_margins",
         type=str,
-        default="0,500,1000",
+        default="0,200,500,800",
         help="기대수익 마진 컷 후보 리스트",
     )
     parser.add_argument(
         "--risk_penalty",
         type=float,
-        default=500.0,
+        default=200.0,
         help="선택된 NG 1건당 패널티",
     )
     parser.add_argument(
         "--score_metric",
         type=str,
-        default="profit_adjusted",
+        default="profit",
         choices=["profit", "profit_adjusted"],
         help="최적 전략 선택 시 사용할 지표",
     )
@@ -243,7 +243,7 @@ def run(args: argparse.Namespace | None = None) -> None:
     expect_thr = 1.0 - (PROFIT_GOOD / (PROFIT_GOOD - LOSS_NG))
     thresholds = build_threshold_candidates(thr_min, thr_max, thr_step, extra + [expect_thr])
     threshold_df = evaluate_thresholds(prob_good_oof, target, thresholds, args.risk_penalty)
-    topn_df = evaluate_topn(prob_good_oof, target, range(20, 201, 10), args.risk_penalty)
+    topn_df = evaluate_topn(prob_good_oof, target, range(20, MAX_SELECTION + 1), args.risk_penalty)
     expected_margins = [float(x) for x in args.expected_margins.split(",") if x.strip()]
     expected_df = evaluate_expected_profit(prob_good_oof, target, np.array(expected_margins), args.risk_penalty)
     results = pd.concat([threshold_df, topn_df, expected_df], ignore_index=True)

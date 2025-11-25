@@ -1,0 +1,20 @@
+{
+  "platt": {
+    "auc": 0.7488222469546127,
+    "brier": 0.11557085857480054
+  },
+  "isotonic": {
+    "auc": 0.7708832004390846,
+    "brier": 0.10433253916923925
+  },
+  "temperature": {
+    "auc": 0.7488222469546127,
+    "brier": 0.11213010517646509
+  },
+  "mean_ensemble": {
+    "auc": 0.7488222469546127,
+    "brier": 0.10889377529208244
+  },
+  "selected": "isotonic",
+  "ensemble_source": "blend_geometric"
+}

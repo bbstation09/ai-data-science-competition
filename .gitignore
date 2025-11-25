@@ -1,5 +1,6 @@
 outputs/
 raw_data/
+5-ai-and-datascience-competition
 conda_env/
 catboost_info/
 *.csv
